@@ -3,8 +3,6 @@ import json
 import logging
 import os
 import signal
-import threading
-import time
 from datetime import datetime, UTC
 from functools import partial
 from types import SimpleNamespace
@@ -26,6 +24,7 @@ config = SimpleNamespace(
         broker = os.environ.get("MQTT_BROKER", "localhost"),
         port = int(os.environ.get("MQTT_PORT", 1883)),
         topic_prefix = "smartrent",
+        client_id = "smartrent"
     ),
     health = SimpleNamespace(
         bind_address = os.environ.get("HEALTH_BIND_ADDRESS", "0.0.0.0"),
@@ -40,7 +39,7 @@ logger = structlog.get_logger()
 
 # -------------------------------- Runtime State ---------------------------------
 state = SimpleNamespace(
-    ready = False,  # Becomes True after successful login and all device start_updater calls
+    smartrent_ready = False,  # Becomes True after successful login and all device start_updater calls
     shutdown = False,
 )
 
@@ -80,37 +79,68 @@ def event_handler(device):
                 data[key] = val
     publish_event(device_type, device_id, data)
 
-
-def on_disconnect(client, userdata, rc):
-    logger.warning("MQTT disconnected, attempting reconnect...", rc=rc)
-
-    def _reconnect_loop():
-        while not state.shutdown:
-            try:
-                client.reconnect()
-                logger.info("MQTT reconnected")
-                break
-            except Exception:
-                logger.warning("MQTT reconnect failed, retrying in 5s...")
-                time.sleep(5)
-
-    threading.Thread(target=_reconnect_loop, daemon=True).start()
-
-
 # ------------------------------------- MQTT -------------------------------------
-mqtt_client = mqtt.Client()
+loglevel_map = {
+    mqtt.LogLevel.MQTT_LOG_INFO: logging.INFO,
+    mqtt.LogLevel.MQTT_LOG_NOTICE: logging.INFO,
+    mqtt.LogLevel.MQTT_LOG_WARNING: logging.WARNING,
+    mqtt.LogLevel.MQTT_LOG_ERR: logging.ERROR,
+    mqtt.LogLevel.MQTT_LOG_DEBUG: logging.DEBUG,
+}
+
+def on_log(client, userdata, paho_level, message):
+    py_level = loglevel_map.get(paho_level, logging.INFO)
+    logger.log(py_level, message)
+
+def on_subscribe(client, userdata, mid, reason_code_list, properties):
+    # Since we subscribed only for a single channel, reason_code_list contains
+    # a single entry
+    if reason_code_list[0].is_failure:
+        logger.error(f"Broker rejected subscription: {reason_code_list[0]}")
+    else:
+        logger.info(f"Broker granted the following QoS: {reason_code_list[0].value}")
+
+def on_unsubscribe(client, userdata, mid, reason_code_list, properties):
+    # Be careful, the reason_code_list is only present in MQTTv5.
+    # In MQTTv3 it will always be empty
+    if len(reason_code_list) == 0 or not reason_code_list[0].is_failure:
+        logger.info("Unsubscribe succeeded")
+    else:
+        logger.error(f"Broker replied with failure: {reason_code_list[0]}")
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    logger.info("Connected to MQTT Broker", reason_code=reason_code)
+    client.subscribe(config.mqtt.topic_prefix)
+
+def on_disconnect(client, obj, flags, reason_code, properties):
+    logger.warning("MQTT disconnected, attempting reconnect...", reason_code=reason_code)
+
+def on_message(client, userdata, message):
+    try:
+        payload=json.loads(message.payload)
+    except Exception:
+        payload={"payload": message.payload}
+    logger.info(message.topic, **payload, message_state=message.state)
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+mqtt_client.on_log = on_log
+mqtt_client.on_connect = on_connect
 mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_subscribe = on_subscribe
+mqtt_client.on_unsubscribe = on_unsubscribe
+mqtt_client.on_message = on_message
+
+mqtt_client.loop_start()
+
 try:
-    mqtt_client.connect(config.mqtt.broker, config.mqtt.port)
-    mqtt_client.loop_start()
-    logger.info("MQTT connected", broker=config.mqtt.broker, port=config.mqtt.port)
+    mqtt_client.connect(config.mqtt.broker, config.mqtt.port, client=id)
 except Exception as e:
-    logger.warning("MQTT connect failed", error=str(e))
+    logger.critical("MQTT connect failed", errno=e.errno, error=e.strerror)
+    raise
 
 # -------------------------------- Health Server ---------------------------------
 app = web.Application()
 routes = web.RouteTableDef()
-
 
 @routes.get("/healthz")
 async def healthz(request):
@@ -121,18 +151,19 @@ async def healthz(request):
 @routes.get("/ready")
 async def ready(request):
     # readiness: True only once we've logged in and started the device updaters
+    # *and* connected to MQTT
+    ready = state.smartrent_ready and mqtt_client.is_connected()
     return web.json_response(
-        {"ready": state.ready, "ts": datetime.now(UTC).isoformat() + "Z"}
+        {"ready": ready, "ts": datetime.now(UTC).isoformat() + "Z"}
     )
 
 
 @routes.get("/metrics")
 async def metrics(request):
-    mqtt_conn = getattr(mqtt_client.is_connected, lambda: False)()
     return web.json_response(
         {
-            "ready": state.ready,
-            "mqtt_connected": mqtt_conn,
+            "smartrent_ready": state.smartrent_ready,
+            "mqtt_connected": mqtt_client.is_connected(),
             "ts": datetime.now(UTC).isoformat() + "Z",
         }
     )
@@ -215,15 +246,12 @@ async def main():
             )
 
     # Mark service ready now!
-    state.ready = True
-    logger.info("Service is ready")
+    state.smartrent_ready = True
+    logger.info("SmartRent is ready")
 
     # Block until signal
     await stop_event.wait()
     logger.info("Shutdown initiated")
-
-    # Graceful teardown
-    state.ready = False
 
     # Stop device updaters (best effort)
     for device in devices:
@@ -233,6 +261,7 @@ async def main():
                 fn()
         except Exception:
             continue
+    state.smartrent_ready = False
 
     # Stop mqtt (best effort)
     try:
