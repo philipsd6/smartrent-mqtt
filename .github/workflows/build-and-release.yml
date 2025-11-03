@@ -1,0 +1,99 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    name: Build and publish image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Dump github context
+        run: echo "$GITHUB_CONTEXT"
+        shell: bash
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Get tags
+        id: meta
+        run: |
+          HEAD_TAGS="$(git tag --points-at HEAD | xargs)"
+          SHA_TAG="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          TAG_LIST="latest $SHA_TAG"
+
+          # Find the latest release version (no -alpha/-beta/-rc suffix)
+          RELEASE_VERSION=$(echo "$HEAD_TAGS" | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+(\s|$)' | sort -nr | head -n1)
+
+          if [[ -n "$RELEASE_VERSION" ]]; then
+              IS_RELEASE_VERSION=true
+
+              # Strip optional 'v' prefix
+              CLEAN_VERSION="${RELEASE_VERSION#v}"
+
+              # Compute major.minor tag (e.g., 1.0 from 1.0.2)
+              MINOR_VERSION=$(echo "$CLEAN_VERSION" | cut -d. -f1,2)
+
+              TAG_LIST="$TAG_LIST $CLEAN_VERSION $MINOR_VERSION"
+          else
+              IS_RELEASE_VERSION=false
+          fi
+          echo "tags=$TAG_LIST" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_release_version=$IS_RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
+          echo "minor_version=$MINOR_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Buildah action
+        id: build-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: ${{ github.event.repository.name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          containerfiles: |
+            ./Containerfile
+
+      - name: Echo Outputs
+        run: |
+          echo "### Build :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "Tags: ${{ steps.build-image.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "Tagged Image: ${{ steps.build-image.outputs.image-with-tag }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Push to the Github Container Registry
+        id: push-to-ghcr
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: ghcr.io/${{ github.repository_owner }}
+
+      - name: Create GitHub Release for version tag
+        if: steps.meta.outputs.is_release_version
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.meta.outputs.release_version }}
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          body: |
+            Podman image published to GHCR:
+
+            - `${{ steps.build-image.outputs.image }}`
+
+            Tags: `${{ steps.build-image.outputs.tags }}`
