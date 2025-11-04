@@ -153,8 +153,9 @@ async def ready(request):
     # readiness: True only once we've logged in and started the device updaters
     # *and* connected to MQTT
     ready = state.smartrent_ready and mqtt_client.is_connected()
+    status_code = 200 if ready else 503
     return web.json_response(
-        {"ready": ready, "ts": datetime.now(UTC).isoformat() + "Z"}
+        {"ready": ready, "ts": datetime.now(UTC).isoformat() + "Z"}, status_code=status_code
     )
 
 
