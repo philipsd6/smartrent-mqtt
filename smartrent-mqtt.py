@@ -123,7 +123,7 @@ class MQTTPublisher(object):
         # Fallback
         return "string", str(value)
 
-    def publish(self, name: str, value, *, set_func: Optional[function] = None, dtype: Optional[str] = None, unit: Optional[str] = None, retain: bool = True, qos: int=1):
+    def publish(self, name: str, value, *, set_func: Optional[type(lambda x: x)] = None, dtype: Optional[str] = None, unit: Optional[str] = None, retain: bool = True, qos: int=1):
         topic = f"{self.base}/{name}"
 
         if dtype is None:
