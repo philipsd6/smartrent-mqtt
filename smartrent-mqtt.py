@@ -84,6 +84,7 @@ logger = structlog.get_logger()
 # -------------------------------- Runtime State ---------------------------------
 state = SimpleNamespace(
     smartrent_ready = False,  # Becomes True after successful login and all device start_updater calls
+    mqtt_is_connected = False, # Update with on_connect/on_disconnect callback.
     shutdown = False,
 )
 
@@ -141,9 +142,12 @@ class MQTTPublisher(object):
             self.client.subscribe(set_topic, qos=1, no_local=True)
 
     async def on_connect(self, client, flags, rc, properties):
+        global state
+        state.mqtt_is_connected = True
         logger.info("Connected to MQTT", client_id=client._client_id)
 
     async def on_disconnect(self, client, packet, exc=None):
+        state.mqtt_is_connected = False
         if exc is not None:
             logger.warning("Disconnected from MQTT", client_id=client._client_id, err=str(exc))
         else:
@@ -239,7 +243,7 @@ async def healthz(request):
 async def ready(request):
     # readiness: True only once we've logged in and started the device updaters
     # *and* connected to MQTT
-    ready = state.smartrent_ready and mqtt_client.is_connected
+    ready = state.smartrent_ready and state.mqtt_is_connected
     status_code = 200 if ready else 503
     return web.json_response(
         {"ready": ready, "ts": datetime.now(UTC).isoformat() + "Z",  "status_code": status_code}
