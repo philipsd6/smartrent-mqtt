@@ -94,6 +94,8 @@ class MQTTPublisher(object):
         self.client = client
         self.base = base_topic.rstrip("/")
         self.subscriptions = {}
+        # Track $type/$writable/$unit topics that only need to be published once
+        self.published_once = set()
 
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -131,15 +133,19 @@ class MQTTPublisher(object):
             dtype, value = self.infer_dtype_and_payload(value)
 
         self.client.publish(topic, payload=value, retain=retain, qos=qos)
-        self.client.publish(f"{topic}/$type", payload=dtype, retain=True, qos=1)
-        self.client.publish(f"{topic}/$writable", payload=json.dumps(set_func is not None), retain=True, qos=1)
-        if unit is not None:
-            self.client.publish(f"{topic}/$unit", unit, retain=True, qos=1)
+
+        if topic not in self.published_once:
+            self.client.publish(f"{topic}/$type", payload=dtype, retain=True, qos=1)
+            self.client.publish(f"{topic}/$writable", payload=json.dumps(set_func is not None), retain=True, qos=1)
+            if unit is not None:
+                self.client.publish(f"{topic}/$unit", unit, retain=True, qos=1)
+            self.published_once.add(topic) # Mark this topic as published
 
         if set_func:
             set_topic = f"{topic}/set"
-            self.subscriptions[set_topic] = set_func
-            self.client.subscribe(set_topic, qos=1, no_local=True)
+            if set_topic not in self.subscriptions:
+                self.subscriptions[set_topic] = set_func
+                self.client.subscribe(set_topic, qos=1, no_local=True)
 
     async def on_connect(self, client, flags, rc, properties):
         global state
@@ -154,7 +160,7 @@ class MQTTPublisher(object):
             logger.info("Disconnected from MQTT", client_id=client._client_id)
 
     async def on_message(self, client, topic, payload, qos, properties):
-        logger.info("Payload", payload=payload)
+        logger.info("Payload", payload=json.loads(payload))
         try:
             val = payload.decode("UTF-8").lower()
             fn = self.subscriptions[topic]
@@ -224,9 +230,16 @@ def event_handler(mqtt_client, device):
             unit = "%"
         if key.endswith("_setpoint") or key.endswith("_temp"):
             unit = "\N{DEGREE SIGN}F"
-        curval = fn()
         setter = setters.get(key, None)
-        mqtt_client.publish(f"{topic}/{key}", value, set_func=setter, unit=unit)
+        wrapped_setter = None
+        if setter:
+            async def wrapped_setter(value, topic=f"{topic}/{key}", setter_fn=setter, getter_fn=fn):
+                current_value = json.dumps(getter_fn())
+                if current_value == value:
+                    logger.warning(f"{topic} is already {json.loads(value)}")
+                    return value
+                await setter_fn(value)
+        mqtt_client.publish(f"{topic}/{key}", value, set_func=wrapped_setter, unit=unit)
 
     mqtt_client.publish(f"{topic}/last_update", event_ts)
 
